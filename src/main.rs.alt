@@ -1,0 +1,87 @@
+use std::fs;
+use std::path::Path;
+use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::io::{BufReader, Read};
+use std::process::Command;
+use serde_json::json;
+use rexif::{ExifTag, parse_buffer};
+
+fn get_exif_date(image_path: &str) -> Option<String> {
+    let file = fs::File::open(image_path).ok()?;
+    let mut bufreader = BufReader::new(file);
+    
+    let mut buffer = Vec::new();
+    bufreader.read_to_end(&mut buffer).ok()?;
+    
+    let exif_data = parse_buffer(&buffer).ok()?;
+    for entry in &exif_data.entries {
+        if entry.tag == ExifTag::DateTimeOriginal {
+            return Some(entry.value.to_string());
+        }
+    }
+    None
+}
+
+fn classify_image(image_path: &str) -> String {
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(format!("import tensorflow as tf; from keras.applications.resnet50 import ResNet50, preprocess_input, decode_predictions; from keras.preprocessing import image; import numpy as np; model = ResNet50(weights='imagenet'); img = image.load_img('{}', target_size=(224, 224)); img_array = image.img_to_array(img); img_array = np.expand_dims(img_array, axis=0); img_array = preprocess_input(img_array); preds = model.predict(img_array); labels = decode_predictions(preds, top=1)[0]; print(labels[0][1])", image_path))
+        .output()
+        .expect("Failed to execute Python script");
+    
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn process_images(folder: &str) -> Vec<HashMap<String, String>> {
+    let path = Path::new(folder);
+    if !path.exists() {
+        println!("Ordner '{}' existiert nicht. Erstelle ihn...", folder);
+        fs::create_dir_all(folder).unwrap();
+    }
+
+    let mut timeline_data = Vec::new();
+    for entry in fs::read_dir(folder).unwrap() {
+        let entry = entry.unwrap();
+        let file_path = entry.path();
+        let file_name = file_path.file_name().unwrap().to_string_lossy().to_string();
+        
+        if let Some(ext) = file_path.extension().and_then(OsStr::to_str) {
+            if ["jpg", "jpeg", "png"].contains(&ext.to_lowercase().as_str()) {
+                println!("Verarbeite: {}", file_name);
+                let date_taken = get_exif_date(file_path.to_str().unwrap())
+                    .unwrap_or_else(|| classify_image(file_path.to_str().unwrap()));
+                
+                let target_folder = Path::new(folder).join(&date_taken);
+                fs::create_dir_all(&target_folder).unwrap();
+                
+                let new_path = target_folder.join(&file_name);
+                fs::rename(&file_path, &new_path).unwrap();
+                
+                let mut image_info = HashMap::new();
+                image_info.insert("Bild".to_string(), file_name);
+                image_info.insert("Neuer Pfad".to_string(), new_path.to_string_lossy().to_string());
+                timeline_data.push(image_info);
+            }
+        }
+    }
+    timeline_data
+}
+
+fn save_timeline(timeline_data: &Vec<HashMap<String, String>>, output_file: &str) {
+    let csv_content = timeline_data.iter()
+        .map(|entry| format!("{},{}", entry["Bild"], entry["Neuer Pfad"]))
+        .collect::<Vec<String>>()
+        .join("\n");
+    
+    fs::write(format!("{}.csv", output_file), csv_content).unwrap();
+    fs::write(format!("{}.json", output_file), json!(timeline_data).to_string()).unwrap();
+}
+
+fn main() {
+    let folder_path = Path::new("/Users/blaubaer/Pictures/iCloud Fotos");  
+    let output_file = "timeline";
+    let timeline = process_images(folder_path.to_str().unwrap());
+    save_timeline(&timeline, output_file);
+}
+
